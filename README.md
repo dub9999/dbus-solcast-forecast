@@ -1,4 +1,4 @@
-# dbus-solcast-forecaster
+# dbus-solcast-forecast
 
 Developped to adjust the max power pulled from the battery on ESS systems
 to ensure that during the next 48 hours:
@@ -7,12 +7,12 @@ to ensure that during the next 48 hours:
 
 Purpose is to set the value at path /Settings/CGwacs/MaxDischargePower for service 'com.victronenergy.settings'
 
-Calculation is based upon:
+Calculation is made using:
 - A forecast of the solar production retrieved from Solcast API: pv_estimate provided on a 30mn period interval
 - A forecast of the consumption based on the last 24 hours consumption also calculated on a 30 mn period interval
 
 Solar forecast query and MaxDichargePower calculation run every 3 hours
-(to remain within the 10 query per day authorized by Solcast for hobbyist accounts) 
+(to remain within the 10 queries per day authorized by Solcast for hobbyist accounts) 
 
 Forecast consumption is updated every 30 mn (for the value of the period ending)
 
