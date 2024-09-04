@@ -29,8 +29,8 @@ VERSION = "0.1"
 __all__ = ['NAME', 'VERSION']
 
 UPDATE_INTERVAL = 250
-
-# Ajustement du fuseau horaire 
+DEFAULT_SAVE_PATH = "/run/media/sda1"
+# Adjusting time zone as system is not aligned with the time zone set in the UI 
 os.environ['TZ'] = 'Europe/Paris'
 tzset()
 
@@ -104,13 +104,8 @@ class SolcastForecast(object):
       'bat_cap' : {'service' : 'com.victronenergy.battery.socketcan_can0', 'path' : '/InstalledCapacity', 'value' : 150},
     }
     self._dbus_imports={}
-    #initialize path to access files where some data are stored
-    #preferrably usb key if available
-    if os.path.exists('/run/media/sda1'):
-      self._file_path='/run/media/sda1'
-    #otherwise in this file directory
-    else:
-      self._file_path=os.getcwd()
+    #initialize path to access files where some data are stored using the constant 
+    self._file_path=(DEFAULT_SAVE_PATH if os.path.exists(DEFAULT_SAVE_PATH) else os.getcwd())
     #other attributes
     self._url = None                      #to store the Solcast API url (site dependent)
     self._prod={}                         #to store the 96 h forecast retrieved from solcast API
@@ -132,7 +127,6 @@ class SolcastForecast(object):
       return True
     else:
       return False
-
 
   #to load the consumption history saved in a file (24h consumption on 30mn interval, json format)
   def __read_cons__(self):
@@ -352,7 +346,8 @@ class SolcastForecast(object):
         #self._forecast_update_called=self.__read_prod__()
         if success:
           self.__calculate_out_max__()
-          self.__update_dbus__()
+          if not os.path.isfile(os.getcwd()+'/no_ess_update'):
+            self.__update_dbus__()
           log.debug(f'New value set for {self._dbus_import_params["out_max"]["path"]}: {self._out_max}')
         log.debug(f'self._consumption_update_called: {self._consumption_update_called} - self._forecast_update_called: {self._forecast_update_called}')   
       if datetime.now().hour % 3 and self._forecast_update_called:
@@ -371,10 +366,10 @@ def main():
   args = parser.parse_args()
 
   logging.basicConfig(
-    filename=os.getcwd()+'/solcastforecast.log', 
-      format='%(asctime)s: %(levelname)-8s %(message)s', 
-      datefmt="%Y-%m-%d %H:%M:%S", 
-      level=(logging.DEBUG if args.debug else logging.INFO))
+    filename=(DEFAULT_SAVE_PATH if os.path.exists(DEFAULT_SAVE_PATH) else os.getcwd()) + '/solcastforecast.log',
+    format='%(asctime)s: %(levelname)-8s %(message)s', 
+    datefmt="%Y-%m-%d %H:%M:%S", 
+    level=(logging.DEBUG if args.debug else logging.INFO))
 
   log.info('start-------------------------------------------------------')
   log.info(__file__+' started')

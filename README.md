@@ -27,7 +27,7 @@ A calculation runs every 3 hours (to remain within the 10 query per day authoriz
 At init:
 - The 24 hours consumption history is loaded from a file in the directory defined to save the values
   if not consumption history is available program is interrupted at initialization
-  A model of the file with consumption values set to 0 is available in the repository to show the expected format
+  A model of the file with consumption values set to 0.0 is available in the repository to show the expected format
   This file must be manually adjusted prior to run the program the first time
   During the loop, the 30 mn consumption values are automaticall updated in the file
   so that after 24 hours the file reflects the reality of the site
@@ -40,7 +40,7 @@ Then a glib loop is created and runs on a 250ms interval:
   If the API query is successful, the full calculation runs
 - The results are automatically pushed to the DBus ending with a new value for /Settings/CGwacs/MaxDischargePower
 - To prevent the /Settings/CGwacs/MaxDischargePower value to be written while keeping the program running
-  insert an empty file named manualmode in the /data/dbus-solcast-forecast folder
+  insert an empty file named no_ess_update in the /data/dbus-solcast-forecast folder
   This will create a kind of manual mode, where consumption and forecasts are still calculated
   but the result is not push to the ESS setting
 
