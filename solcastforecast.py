@@ -81,7 +81,9 @@ class ConsumptionCalculator(object):
 
 class SolcastForecast(object):
 
-  def __init__(self):
+  def __init__(self, auth_write):
+    #to skip the update of MaxDischargePower on dbus
+    self.auth_write=auth_write
     #name of the dbus service where to publish calculated values
     self._dbus_service_name = 'com.victronenergy.forecast'
     #initialize forecast variable
@@ -172,6 +174,14 @@ class SolcastForecast(object):
       log.error('Unidentified error when contacting Solcast API')
     return False
 
+  #to validate value change on the dbus service
+  def __callback_authwrite_change__(self, path, newvalue):
+    if not newvalue:
+      log.info('!!!!!!!!!Change of MaxDischargedPower is NOT authorized')
+    else:
+      log.info('Change of MaxDischargedPower is authorized')
+    return True
+  
   #to initialize the interface with dbus
   def __init_dbus__(self):
     #initialize the bus to connect to
@@ -179,13 +189,16 @@ class SolcastForecast(object):
 
     #create the VeDbusService
     self._dbus_service = VeDbusService(self._dbus_service_name, register=False)
+
     #add the required paths
+    self._dbus_service.add_path('/AuthorizeWriteMaxDischargePower', value=1 if self.auth_write else 0, \
+      description='set to 1 to authorize to write the MaxDischargePower after calculation', writeable=True,
+      onchangecallback=self.__callback_authwrite_change__, gettextcallback=None, valuetype=dbus.Boolean)
     for i in range(96):
       for name, item in self._dbus_service_params.items():
-        self._dbus_service.add_path(f'/{i:02d}{item["path"]}',item["value"])
+        self._dbus_service.add_path(f'/Forecast/{i:02d}{item["path"]}',item["value"])
     #claim the service name on dbus only if not already existing
-    if self._dbus_service_name not in self._dbus_bus.list_names():
-      self._dbus_service.register()
+    self._dbus_service.register()
     
     #import the dbus objects
     for name, item in self._dbus_import_params.items():
@@ -195,12 +208,15 @@ class SolcastForecast(object):
   def __read_dbus__(self):
     for name, item in self._dbus_import_params.items():
       item['value'] = self._dbus_imports[name].get_value()
+    self.auth_write=self._dbus_service['/AuthorizeWriteMaxDischargePower']
+    return True
 
   #to update the energy consumption in a period (period_end must be local time provided in format "%H:%M")
   def __update_cons__(self, period_end):
     log.debug(f'Consumption of the period before update: {self._cons[period_end]}')
     self._cons[period_end] = round(self._consumption_calculator.update(self._cons['period_end']), 2)
     log.debug(f'Consumption of the period after update: {self._cons[period_end]}')
+    return True
 
   #to calculate the max power pulled from the battery
   def __calculate_out_max__(self):
@@ -297,6 +313,10 @@ class SolcastForecast(object):
     try:
       #initialize the interface with dbus
       self.__init_dbus__()
+      if not self._dbus_service['/AuthorizeWriteMaxDischargePower']:
+        log.info('!!!!!!!!!Change of MaxDischargedPower is NOT authorized')
+      else:
+        log.info('Change of MaxDischargedPower is authorized')
       
       #initialize the consumption calculator
       self._consumption_calculator = ConsumptionCalculator()
@@ -325,6 +345,7 @@ class SolcastForecast(object):
     if os.path.isfile(os.getcwd()+'/kill'):
       os.remove(os.getcwd()+'/kill')
       self.__exit_program__()
+
     #run updates when required
     #we use self._consumption_update_called and self._forecast_update_called
     # to avoid calling again and again the same update if an exception has occured
@@ -346,9 +367,10 @@ class SolcastForecast(object):
         #self._forecast_update_called=self.__read_prod__()
         if success:
           self.__calculate_out_max__()
-          if not os.path.isfile(os.getcwd()+'/no_ess_update'):
+          log.debug(f'New value calculated for {self._dbus_import_params["out_max"]["path"]}: {self._out_max}')
+          if self._dbus_service['/AuthorizeWriteMaxDischargePower']:
             self.__update_dbus__()
-          log.debug(f'New value set for {self._dbus_import_params["out_max"]["path"]}: {self._out_max}')
+            log.debug(f'New value set for {self._dbus_import_params["out_max"]["path"]}: {self._out_max}')
         log.debug(f'self._consumption_update_called: {self._consumption_update_called} - self._forecast_update_called: {self._forecast_update_called}')   
       if datetime.now().hour % 3 and self._forecast_update_called:
         self._forecast_update_called=False
@@ -362,6 +384,8 @@ def main():
   parser = ArgumentParser(add_help=True)
   parser.add_argument('-d', '--debug', help='enable debug logging',
                         action='store_true')
+  parser.add_argument('-s', '--skip', help='to skip change of MaxDischargePower on dbus after calculation',
+                        action='store_false')
 
   args = parser.parse_args()
 
@@ -380,7 +404,7 @@ def main():
   dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
   mainloop = GLib.MainLoop()
 
-  forecast=SolcastForecast()
+  forecast=SolcastForecast(args.skip)
 
   forecast.init()
   log.info('Initialisation completed, now running permanent loop')
