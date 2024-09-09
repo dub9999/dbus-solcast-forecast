@@ -23,12 +23,16 @@ At init:
   During the loop, the 30 mn consumption values are automatically updated in the file.
   so that after 24 hours the file reflects the reality of the site.
 - A dbus service named com.victronenergy.forecast is created to store the forecasted values.
-- A path /AuthorizeWriteMaxDischargePower is created with boolean value set to 1 (value is writable to change config if needed, see below)
-- A path /forecast/NN/subpaths with NN from 00 to 95 and subpaths reflecting the paths for the 8 calculated values (see above)
+- The following paths are created:
+  - /AuthorizeWriteMaxDischargePower is created with boolean value set to 1 (value is writable to change config if needed, see below)
+  - /TotalForecastedProduction and /TotalForecastedConsumption to show the cumulated production and cummulated consumption expected in the next 48 hours
+  - /Forecast/'NN'/'subpaths' with 'NN' from 00 to 95 and 'subpaths' reflecting the access for the 8 calculated values (see above)
 
-Then a glib loop is created and runs on a 250ms interval:
+After initialization a glib loop is created and runs on a 250ms interval:
 - Consumption history is calculated every 30mn for the period that just ended.
-- Production forecast is updated every 3 hours by a Curl query to Solcast API (to remain within the 10 query per day authorized by Solcast for hobbyist accounts). Then a calculation runs and publishes the following 30 mn based values on a dbus service for the next 48 hours:
+- Production forecast is updated every 3 hours through a Curl query to Solcast API
+- the 3 hours interval allows to remain within the 10 query per day authorized by Solcast for hobbyist accounts.
+- Then a calculation runs the following 30 mn based values on a dbus service for the next 48 hours:
   - The period end in local time formatted like "YYYY-mm-dd HH:MM:SS".
   - The production forecast based on solcast pv-estimate (/Energy/Produced).
   - The local consumption based on the last 24 hours consumption history (/Energy/Consumed).
@@ -37,19 +41,26 @@ Then a glib loop is created and runs on a 250ms interval:
   - The energy imported from the grid (/Energy/Imported).
   - The energy exported to the grid (/Energy/Exported).
   - The forecasted battery soc (/BatterySoc) at the end of the period.
+- Calculation also returns
+  - The expected cumulated production
+  - The expected cumulated consumption
+  - The optimized value for the maximum discharge power of the battery
 - If the solcast API returns an error, the error is logged and the calculation is not processed but the glib loop continues.
-- The results are automatically pushed to the DBus ending with a new value for /Settings/CGwacs/MaxDischargePower.
+- If everything go smooth, the results are published on the DBus.
 
 About 'com.victronenergy.forecast /AuthorizeWriteMaxDischargePower':
 - The value is of type boolean and is writable. 
 - If value is set to 1 as done when python code is launched without the -s attribute, the result of the calculation is pushed to 'com.victronenergy.settings /Settings/CGwacs/MaxDischargePower'.
 - Calling the python code with argument -s or --skip will set the value to 0 
-- The value can also be changed using dbus command from console while the forecast is running
+- The value can also be changed using dbus-spy or a dbus command from console while the forecast is running
 - If value is set to 0, the code will run as usual except 'com.victronenergy.settings' /Settings/CGwacs/MaxDischargePower' value will not be written. This is a way to keep the code running without interacting with the normal Multiplus operation.
 
-This repository must be installed on /data to survive to firmware updates.
-
 ## Installation
+### Nota:
+- Registration of a user account at Solcast is required to obtain an API key https://solcast.com.au/api/register.
+- Without an API key there is no chance to successfully obtain valid API results.
+
+This repository must be installed on /data to survive to firmware updates.
 - Create a repository '/data/dbus-solcast-forecast' in the venus device and copy all files and subfolders of this repository.
 - Adjust the empty file 'solcast_url.cfg' with the complete solcast API url for the site including api_key parameter.
 - Open 'solcastforecast.py' and adjust the constant DEFAULT_SAVE_PATH to show where program must read and save the consumption history file and where to find the log file. The actual default saving path is set to usb key: /run/media/sda1. If DEFAULT_SAVE_PATH is not accessible, the current folder is used.
