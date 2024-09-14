@@ -39,7 +39,7 @@ os.environ['TZ'] = 'Europe/Paris'
 tzset()
 
 class ConsumptionCalculator(object):
-
+    # all values in kWh
     def __init__(self):
         self.bus=dbus.SessionBus() if 'DBUS_SESSION_BUS_ADDRESS' in os.environ else dbus.SystemBus()
         self.meters={
@@ -120,21 +120,26 @@ class ConsumptionCalculator(object):
 
 class SolcastForecast(object):
 
-    def __init__(self, auth_write):
+    def __init__(self, auth_write, load_prod):
         #to skip the update of MaxDischargePower on dbus
         self.auth_write=auth_write
+        #to load the production forecast from file instead of making curl request to solcast (for testing purposes)
+        self.load_prod=load_prod
         #name of the dbus service where to publish calculated values
         self.dbus_service_name = 'com.victronenergy.forecast'
         #initialize forecast variable
         self.dbus_service_params={
-            'period_end' : {'path' : '/PeriodEnd', 'value' : "0000-00-00 00:00:00"},
-            'battery_soc' : {'path' : '/BatterySoc', 'value' : 0},
-            'consumed' : {'path' : '/Consumed', 'value' : 0},
-            'produced' : {'path' : '/Produced', 'value' : 0},
-            'imported' : {'path' : '/Imported', 'value' : 0},
-            'exported' : {'path' : '/Exported', 'value' : 0},
-            'retained' : {'path' : '/Retained', 'value' : 0},
-            'released' : {'path' : '/Released', 'value' : 0},
+            'total_prod' : {'path' : '/TotalProduced', 'value' : 0},
+            'total_cons' : {'path' : '/TotalConsumed', 'value' : 0},
+            'timestamp' : {'path' : '/Timestamp', 'value' : datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:00.000Z")},
+            'batt_soc' : {'path' : '/BatterySoc', 'value' : None},
+            'consumed' : {'path' : '/Consumed', 'value' : None},
+            'produced' : {'path' : '/Produced', 'value' : None},
+            'imported' : {'path' : '/Imported', 'value' : None},
+            'exported' : {'path' : '/Exported', 'value' : None},
+            'retained' : {'path' : '/Retained', 'value' : None},
+            'released' : {'path' : '/Released', 'value' : None},
+            'autocons' : {'path' : '/Autocons', 'value' : None},
         }
         self.dbus_import_params={
             'grid_sp' : {
@@ -263,11 +268,8 @@ class SolcastForecast(object):
             gettextcallback=None, 
             valuetype=dbus.Boolean
             )
-        self.dbus_service.add_path('/TotalForecastedProduction', value=0)
-        self.dbus_service.add_path('/TotalForecastedConsumption', value=0)
-        for i in range(96):
-            for name, item in self.dbus_service_params.items():
-                self.dbus_service.add_path(f'/Forecast/{i:02d}{item["path"]}',item["value"])
+        for name, item in self.dbus_service_params.items():
+            self.dbus_service.add_path(f'{item["path"]}',item["value"])
         #claim the service name on dbus only if not already existing
         self.dbus_service.register()
     
@@ -304,93 +306,116 @@ class SolcastForecast(object):
         self.out_max = (sp_min+sp_max)/2    #calculated max power output
         total_produced=0
         total_consumed=0
-        period_end=[]
-        battery_soc=[]
+        batt_soc=[]
         produced=[]
         consumed=[]
         released=[]
         retained=[]
         imported=[]
         exported=[]
+        autocons=[]
+        forecasts=[]
         #start the loops trying to find the optimal power output 
         #to maintain forecasted battery soc between soc_min+5% and 95%
+        #all energies are calcuated in kWh, multiplied by 100 and rounded to int
+        #to allow to publish as text with length lower than 256 characters
+        #for further reading by HomeAssistant MQTT text 
+        # only total_produced and total_consumed are in kWh
         #stop after 10 iterations in any case
         for iteration in range(10):
             #reset variables and lists
             total_produced=0
             total_consumed=0
-            period_end*=0
-            battery_soc*=0
+            batt_soc*=0
             produced*=0
             consumed*=0
             released*=0
             retained*=0
             imported*=0
             exported*=0
+            autocons*=0
             #loop all the records of the solar production forecast (96 x 30 minutes periods)
             #use enumerate to keep track of the item index
             for index, item in enumerate(self.prod['forecasts']):
-                #depending time when the solcas query is made, 97 records can be returned
-                #we stop after 96 records in any case
-                if index>95:
+                #we are only interested in the forecast for the next 24 hours
+                #we stop after 48 records in any case
+                if index>47:
                     break
                 #adjust period_end value to local time
-                period_end.append(
-                    datetime.strftime(
-                        datetime.strptime(item["period_end"], "%Y-%m-%dT%H:%M:%S.0000000Z")
-                            .replace(tzinfo=timezone(timedelta(seconds=0), 'UTC')).astimezone()
-                        ),
-                        "%Y-%m-%d %H:%M:%S"
-                    )
+                period_loc=datetime.strptime(item["period_end"], "%Y-%m-%dT%H:%M:%S.0000000Z")\
+                            .replace(tzinfo=timezone(timedelta(seconds=0), 'UTC'))\
+                            .astimezone()
+                #if first period, calculate the reference timestamp in UTC time
+                if index==0:
+                    ts=(datetime.strptime(item["period_end"], "%Y-%m-%dT%H:%M:%S.0000000Z")
+                        .replace(tzinfo=timezone(timedelta(seconds=0), 'UTC'))
+                        - timedelta(minutes=30))
+                #initialize the ratio to between energy and power on the period
+                if (index ==0 and not self.load_prod):
+                    period_ratio=round(3600/(period_loc-datetime.now().astimezone()).seconds)
+                else:
+                    period_ratio=2
                 #store the battery soc at the beginning of the period
                 soc_prev=(
                     self.dbus_import_params['bat_soc']['value'] if index == 0 
-                        else battery_soc[index-1]
+                        else batt_soc[index-1]
                     )
-                #retrieve the forecasted production for the period
-                produced.append(item['pv_estimate'])
-                #retrieve the forecasted consumption for the period
-                consumed.append(self.cons[datetime.strftime(period_end[index],"%H:%M")])
-                #calculate energy discharged from the battery
-                released.append(min(
+                #all values are calculated average power
+                #in 10W unit rounded as int to limit size of the dbus publish message to 256 characters
+                #
+                #retrieve the forecasted production for the period (already average power in kW, so x100)
+                produced.append(int(round(item['pv_estimate']*100,0)))
+                #retrieve the forecasted consumption for the period (in kWh so x100 and x2 because was calculated on 30 mn)
+                consumed.append(int(round(self.cons[datetime.strftime(period_loc,"%H:%M")]*100*2,0)))
+                #calculate average power discharged from the battery
+                #out_max and grid_sp are in W so /10,
+                #available battery capacity calculated in Wh so /10 and xperiod_ratio 
+                released.append(int(round(min(
                     self.dbus_import_params['bat_soh']['value']/100
-                        *self.dbus_import_params['bat_cap']['value']*0.048
-                        *(soc_prev-self.dbus_import_params['soc_min']['value'])/100,
+                        *self.dbus_import_params['bat_cap']['value']*48
+                        *(soc_prev-self.dbus_import_params['soc_min']['value'])/100
+                        /10*period_ratio,
                     min(
-                        self.out_max/2000, 
+                        self.out_max/10, 
                         max(
                             0, 
                             consumed[index]-produced[index]
-                                -self.dbus_import_params['grid_sp']['value']/2000 
+                                -self.dbus_import_params['grid_sp']['value']/10 
                             )
                         )
-                    ))
-                #calculate energy charged into the battery
-                retained.append(min(
+                    ))))
+                #calculate average power charged into the battery
+                #available battery capacity calculated in Wh so /10 and xperiod_ratio 
+                retained.append(int(round(min(
                     self.dbus_import_params['bat_soh']['value']/100
-                        *self.dbus_import_params['bat_cap']['value']*0.052
-                        *(100-soc_prev)/100,
+                        *self.dbus_import_params['bat_cap']['value']*52
+                        *(100-soc_prev)/100
+                        /10*period_ratio,
                     max(0, produced[index]-consumed[index])
-                    ))
+                    ))))
                 #calculate exchanges with grid
-                imported.append(max(0, consumed[index]-produced[index]-released[index]))
-                exported.append(max(0, produced[index]-consumed[index]-retained[index]))
+                imported.append(int(max(0, consumed[index]-produced[index]-released[index])))
+                exported.append(int(max(0, produced[index]-consumed[index]-retained[index])))
+                #calculate self consumption
+                autocons.append(int(max(0, consumed[index]-imported[index]-released[index])))
                 #calculate the battery soc at the period end
                 #soc is calculated using Ah battery capacity
                 #with 52V charge voltage and 48V discharge voltage
-                battery_soc.append(
+                #retained and released are calculated back into Wh so *10 and /period_ratio
+                batt_soc.append(int(round(
                     soc_prev
-                    +(retained[index]/0.052-released[index]/0.048)
+                    +(retained[index]/52-released[index]/48)*10/period_ratio
                         /(self.dbus_import_params['bat_soh']['value']
                             *self.dbus_import_params['bat_cap']['value']) 
                         *10000
-                    )
+                    ,0)))
                 #update soc_max and soc_min
-                soc_max=max(soc_max, battery_soc[index])
-                soc_min=min(soc_min, battery_soc[index])
-                #update the total_cons and total_prod
-                total_produced+=produced[index]
-                total_consumed+=consumed[index]
+                soc_max=max(soc_max, batt_soc[index])
+                soc_min=min(soc_min, batt_soc[index])
+                #update the total_cons and total_prod (in kWh)
+                #produced and consumed are calculated back into kWh so /100 and /period_ratio
+                total_produced+=produced[index]/100/period_ratio
+                total_consumed+=consumed[index]/100/period_ratio
 
             #update regression interval and continue loop if soc is going below lower limit
             if soc_min < self.dbus_import_params['soc_min']['value']+5:
@@ -411,19 +436,17 @@ class SolcastForecast(object):
         elif self.out_max > out_top - 2:
             self.out_max = out_top
         #publish calculated values on dbus
-        self.dbus_service['/TotalForecastedProduction']=total_produced
-        self.dbus_service['/TotalForecastedConsumption']=total_consumed
-        for index, item in enumerate(period_end):
-            head=f'/Forecast/{index:02d}'
-            self.dbus_service[f'{head}/PeriodEnd']=item
-            self.dbus_service[f'{head}/BatterySoc']=battery_soc[index]
-            self.dbus_service[f'{head}/Produced']=produced[index]
-            self.dbus_service[f'{head}/Consumed']=consumed[index]
-            self.dbus_service[f'{head}/Retained']=retained[index]
-            self.dbus_service[f'{head}/Released']=released[index]
-            self.dbus_service[f'{head}/Imported']=imported[index]
-            self.dbus_service[f'{head}/Exported']=exported[index]
- 
+        self.dbus_service['/Timestamp']=ts.strftime('%Y-%m-%dT%H:%M:00.000Z')
+        self.dbus_service['/TotalProduced']=round(total_produced,3)
+        self.dbus_service['/TotalConsumed']=round(total_consumed,3)
+        self.dbus_service['/BatterySoc']=json.dumps(batt_soc)
+        self.dbus_service['/Produced']=json.dumps(produced)
+        self.dbus_service['/Consumed']=json.dumps(consumed)
+        self.dbus_service['/Retained']=json.dumps(retained)
+        self.dbus_service['/Released']=json.dumps(released)
+        self.dbus_service['/Imported']=json.dumps(imported)
+        self.dbus_service['/Exported']=json.dumps(exported)
+        self.dbus_service['/Autocons']=json.dumps(autocons)
         return True
 
     #pour terminer la boucle permanente de façon propre
@@ -496,14 +519,16 @@ class SolcastForecast(object):
             if datetime.now().minute % 30 and self.consumption_update_called:
                 self.consumption_update_called=False
 
-            #do the forecast every 3 hours or once when a new hour starts if it is first calculation
-            if (
-                (not(datetime.now().hour % 3) and not(self.forecast_update_called)) 
-                or (datetime.now().minute==0 and not(self.forecast_update_ready))
+            #do the forecast every 3 hours or at program start
+            if ((not self.load_prod and not(datetime.now().hour % 3) and not(self.forecast_update_called)) 
+                or not(self.forecast_update_ready)
                 ):
                 self.forecast_update_ready=True
                 self.forecast_update_called=True
-                success=self.__curl_prod__()
+                if not self.load_prod:
+                    success=self.__curl_prod__()
+                else:
+                    success=self.__read_prod__()
                 if success:
                     self.__calculate_out_max__()
                     log.info(
@@ -533,6 +558,8 @@ def main():
     parser = ArgumentParser(add_help=True)
     parser.add_argument('-d', '--debug', help='enable debug logging',
                         action='store_true')
+    parser.add_argument('-l', '--load', help='to load production from file instead of making curl to solcast',
+                        action='store_true')
     parser.add_argument('-s', '--skip', help='to skip writing of MaxDischargePower on dbus',
                         action='store_false')
 
@@ -558,7 +585,7 @@ def main():
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     mainloop = GLib.MainLoop()
 
-    forecast=SolcastForecast(args.skip)
+    forecast=SolcastForecast(args.skip, args.load)
 
     forecast.init()
     log.info(f'initialization completed, now running permanent loop')
