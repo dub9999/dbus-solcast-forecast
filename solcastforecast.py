@@ -120,11 +120,9 @@ class ConsumptionCalculator(object):
 
 class SolcastForecast(object):
 
-    def __init__(self, auth_write, load_prod):
+    def __init__(self, auth_write):
         #to skip the update of MaxDischargePower on dbus
         self.auth_write=auth_write
-        #to load the production forecast from file instead of making curl request to solcast (for testing purposes)
-        self.load_prod=load_prod
         #name of the dbus service where to publish calculated values
         self.dbus_service_name = 'com.victronenergy.forecast'
         #initialize forecast variable
@@ -179,12 +177,12 @@ class SolcastForecast(object):
         self.prod={}
         self.cons={}
         self.out_max=0
-        self.forecast_update_called=True #set to True to launch the forecast update 
+        self.solcast_forecast_called = False
+        self.solcast_forecast_available = False
         #if program starts at time when update is supposed to be called
         self.consumption_update_called=False #set to False to prevent launching the consumption update 
-        #if program starts at time when update is supposed to be called
-        self.forecast_update_ready=False
         self.consumption_update_ready=False
+        self.out_max_calculated = False
 
     #to read the solcast url in a configuration file stored in the working folder as it is site specific
     def __read_url__(self):
@@ -209,7 +207,7 @@ class SolcastForecast(object):
             return False
 
     #to save everything that we want to save
-    def __save__(self):
+    def __save_cons__(self):
         filename=self.file_path+'/cons_history.json'
         with open(filename, mode="w", encoding="utf-8") as file:
             json.dump(self.cons, file)
@@ -220,7 +218,12 @@ class SolcastForecast(object):
         if os.path.isfile(filename):
             with open(filename, mode="r", encoding="utf-8") as file:
                 self.prod = json.load(file)
-            return True
+            #check if forecast is younger than 3 hours
+            td = datetime.utcnow() - datetime.strptime(self.prod['forecasts'][0]["period_end"], "%Y-%m-%dT%H:%M:%S.0000000Z")
+            if td.days==0 and td.seconds<=10800:
+                 return True
+            else:
+                return False
         else:
             return False
 
@@ -245,9 +248,9 @@ class SolcastForecast(object):
     #to validate value change on the dbus service
     def __callback_authwrite_change__(self, path, newvalue):
         if not newvalue:
-            log.info('!!!!!!!!!Change of MaxDischargedPower is NOT authorized')
+            log.debug('!!!!!!!!!Change of MaxDischargedPower is NOT authorized')
         else:
-            log.info('Change of MaxDischargedPower is authorized')
+            log.debug('Change of MaxDischargedPower is authorized')
         return True
   
     #to initialize the interface with dbus
@@ -334,9 +337,9 @@ class SolcastForecast(object):
             imported*=0
             exported*=0
             autocons*=0
+            index=0
             #loop all the records of the solar production forecast (96 x 30 minutes periods)
-            #use enumerate to keep track of the item index
-            for index, item in enumerate(self.prod['forecasts']):
+            for item in self.prod['forecasts']:
                 #we are only interested in the forecast for the next 24 hours
                 #we stop after 48 records in any case
                 if index>47:
@@ -345,16 +348,9 @@ class SolcastForecast(object):
                 period_loc=datetime.strptime(item["period_end"], "%Y-%m-%dT%H:%M:%S.0000000Z")\
                             .replace(tzinfo=timezone(timedelta(seconds=0), 'UTC'))\
                             .astimezone()
-                #if first period, calculate the reference timestamp in UTC time
-                if index==0:
-                    ts=(datetime.strptime(item["period_end"], "%Y-%m-%dT%H:%M:%S.0000000Z")
-                        .replace(tzinfo=timezone(timedelta(seconds=0), 'UTC'))
-                        - timedelta(minutes=30))
-                #initialize the ratio to between energy and power on the period
-                if (index ==0 and not self.load_prod):
-                    period_ratio=round(3600/(period_loc-datetime.now().astimezone()).seconds)
-                else:
-                    period_ratio=2
+                #if period end is in the past skip the calculation
+                if period_loc<=datetime.now().astimezone():
+                    continue
                 #store the battery soc at the beginning of the period
                 soc_prev=(
                     self.dbus_import_params['bat_soc']['value'] if index == 0 
@@ -369,12 +365,12 @@ class SolcastForecast(object):
                 consumed.append(int(round(self.cons[datetime.strftime(period_loc,"%H:%M")]*100*2,0)))
                 #calculate average power discharged from the battery
                 #out_max and grid_sp are in W so /10,
-                #available battery capacity calculated in Wh so /10 and xperiod_ratio 
+                #available battery capacity calculated in Wh so /10 and x2
                 released.append(int(round(min(
                     self.dbus_import_params['bat_soh']['value']/100
                         *self.dbus_import_params['bat_cap']['value']*48
                         *(soc_prev-self.dbus_import_params['soc_min']['value'])/100
-                        /10*period_ratio,
+                        /10*2,
                     min(
                         self.out_max/10, 
                         max(
@@ -385,12 +381,12 @@ class SolcastForecast(object):
                         )
                     ))))
                 #calculate average power charged into the battery
-                #available battery capacity calculated in Wh so /10 and xperiod_ratio 
+                #available battery capacity calculated in Wh so /10 and x2 
                 retained.append(int(round(min(
                     self.dbus_import_params['bat_soh']['value']/100
                         *self.dbus_import_params['bat_cap']['value']*52
                         *(100-soc_prev)/100
-                        /10*period_ratio,
+                        /10*2,
                     max(0, produced[index]-consumed[index])
                     ))))
                 #calculate exchanges with grid
@@ -401,10 +397,10 @@ class SolcastForecast(object):
                 #calculate the battery soc at the period end
                 #soc is calculated using Ah battery capacity
                 #with 52V charge voltage and 48V discharge voltage
-                #retained and released are calculated back into Wh so *10 and /period_ratio
+                #retained and released are calculated back into Wh so *10 and /2
                 batt_soc.append(int(round(
                     soc_prev
-                    +(retained[index]/52-released[index]/48)*10/period_ratio
+                    +(retained[index]/52-released[index]/48)*10/2
                         /(self.dbus_import_params['bat_soh']['value']
                             *self.dbus_import_params['bat_cap']['value']) 
                         *10000
@@ -413,12 +409,15 @@ class SolcastForecast(object):
                 soc_max=max(soc_max, batt_soc[index])
                 soc_min=min(soc_min, batt_soc[index])
                 #update the total_cons and total_prod (in kWh)
-                #produced and consumed are calculated back into kWh so /100 and /period_ratio
-                total_produced+=produced[index]/100/period_ratio
-                total_consumed+=consumed[index]/100/period_ratio
+                #produced and consumed are calculated back into kWh so /100 and /2
+                total_produced+=produced[index]/100/2
+                total_consumed+=consumed[index]/100/2
+                #
+                index += 1
 
             #update regression interval and continue loop if soc is going below lower limit
-            if soc_min < self.dbus_import_params['soc_min']['value']+5:
+            #or not recharging battery to the expected level
+            if (soc_min < self.dbus_import_params['soc_min']['value']+5) or (soc_max < 85):
                 run_loop=1
                 sp_max=self.out_max
                 self.out_max=(self.out_max+sp_min)/2
@@ -436,7 +435,7 @@ class SolcastForecast(object):
         elif self.out_max > out_top - 2:
             self.out_max = out_top
         #publish calculated values on dbus
-        self.dbus_service['/Timestamp']=ts.strftime('%Y-%m-%dT%H:%M:00.000Z')
+        self.dbus_service['/Timestamp']=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:00.000Z')
         self.dbus_service['/TotalProduced']=round(total_produced,3)
         self.dbus_service['/TotalConsumed']=round(total_consumed,3)
         self.dbus_service['/BatterySoc']=json.dumps(batt_soc)
@@ -449,10 +448,10 @@ class SolcastForecast(object):
         self.dbus_service['/Autocons']=json.dumps(autocons)
         return True
 
-    #pour terminer la boucle permanente de façon propre
+    #to end glib loop nicely
     def __soft_exit__(self):
         log.info('terminated on request')
-        self.__save__()
+        self.__save_cons__()
         log.info('24 h consumption history saved to file')
         os._exit(1)
 
@@ -478,6 +477,11 @@ class SolcastForecast(object):
             #initialize the solcast url (read from file)
             self.__read_url__()
 
+            #read the production forecast in the file
+            self.solcast_forecast_available = self.__read_prod__()
+            if not self.solcast_forecast_available:
+                log.info('could not read recent production forecast')
+                log.info('wait for next hour turn to curl solcast api')
         except:
             log.error('exception occured during init', exc_info=True)
             os._exit(1)
@@ -494,11 +498,42 @@ class SolcastForecast(object):
         # to avoid calling again and again the same update if an exception has occured
         #we use self.consumption_update_ready
         # to update the consumption only if a full 30 mn period has been completed after init
-        #we use self.forecast_update_ready
+        #we use self.solcast_forecast_available
         # to calculate a new forecast as soon as a new hour starts after init
         try:
-            #check if a 30mn period end is reached
+            #every 3 hours
+            if ((not(datetime.now().hour % 3) 
+                or (datetime.now().minute == 0 and not self.solcast_forecast_available))
+                and not self.solcast_forecast_called):
+                #curl solcast api
+                if self.__curl_prod__():
+                    self.solcast_forecast_available = True
+                    self.__save_prod__()
+                    log.debug('production_forecast saved to file')
+                self.solcast_forecast_called = True
+            #reset
+            if datetime.now().hour % 3 and self.solcast_forecast_called:
+                self.solcast_forecast_called = False
+
+            #every 30 mn period
             if not(datetime.now().minute % 30):
+                #if a recent forecast is available do the out_max calculation
+                if self.solcast_forecast_available and not self.out_max_calculated:
+                    self.out_max_calculated = self.__calculate_out_max__()
+                    log.debug(
+                        f'New value calculated for {self.dbus_import_params["out_max"]["path"]}: '
+                        +f'{self.out_max}'
+                        )
+                    if (
+                        self.dbus_service['/AuthorizeWriteMaxDischargePower'] 
+                        and (abs(self.out_max - self.dbus_import_params['out_max']['value']) > 2)
+                        ):
+                        self.dbus_imports['out_max'].set_value(self.out_max)
+                        log.debug(
+                            f'New value set for {self.dbus_import_params["out_max"]["path"]}: '
+                            +f'{self.out_max}'
+                            )
+                #calculate the consumption of the last 30 mn
                 #skip the first period end after init 
                 #to make sure the calculation is made with a full 30 mn period
                 if not(self.consumption_update_ready):
@@ -512,42 +547,13 @@ class SolcastForecast(object):
                         +f'{datetime.strftime(datetime.now(),"%H:%M")}: '
                         +f'{self.cons[datetime.strftime(datetime.now(),"%H:%M")]}'
                         )
-                    self.__save__()
+                    self.__save_cons__()
                     log.debug('24 h consumption history saved to file')
 
             #reset
             if datetime.now().minute % 30 and self.consumption_update_called:
-                self.consumption_update_called=False
-
-            #do the forecast every 3 hours or at program start
-            if ((not self.load_prod and not(datetime.now().hour % 3) and not(self.forecast_update_called)) 
-                or not(self.forecast_update_ready)
-                ):
-                self.forecast_update_ready=True
-                self.forecast_update_called=True
-                if not self.load_prod:
-                    success=self.__curl_prod__()
-                else:
-                    success=self.__read_prod__()
-                if success:
-                    self.__calculate_out_max__()
-                    log.info(
-                        f'New value calculated for {self.dbus_import_params["out_max"]["path"]}: '
-                        +f'{self.out_max}'
-                        )
-                    if (
-                        self.dbus_service['/AuthorizeWriteMaxDischargePower'] 
-                        and (abs(self.out_max - self.dbus_import_params['out_max']['value']) > 2)
-                        ):
-                        self.dbus_imports['out_max'].set_value(self.out_max)
-                        log.info(
-                            f'New value set for {self.dbus_import_params["out_max"]["path"]}: '
-                            +f'{self.out_max}'
-                            )
-
-            #reset
-            if datetime.now().hour % 3 and self.forecast_update_called:
-                self.forecast_update_called=False
+                self.out_max_calculated = False
+                self.consumption_update_called = False
 
         except:
             log.error('exception occured during update', exc_info=True)
@@ -557,8 +563,6 @@ class SolcastForecast(object):
 def main():
     parser = ArgumentParser(add_help=True)
     parser.add_argument('-d', '--debug', help='enable debug logging',
-                        action='store_true')
-    parser.add_argument('-l', '--load', help='to load production from file instead of making curl to solcast',
                         action='store_true')
     parser.add_argument('-s', '--skip', help='to skip writing of MaxDischargePower on dbus',
                         action='store_false')
@@ -572,8 +576,6 @@ def main():
         level=(logging.DEBUG if args.debug else logging.INFO)
         )
 
-    log.info('')
-    log.info('------------------------------------------------------------')
     log.info(
         f'started, logging to '
         f'{DEF_PATH+LOGFILE if os.path.exists(DEF_PATH) else os.path.abspath(__file__)+".log"}'
@@ -585,7 +587,7 @@ def main():
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     mainloop = GLib.MainLoop()
 
-    forecast=SolcastForecast(args.skip, args.load)
+    forecast=SolcastForecast(args.skip)
 
     forecast.init()
     log.info(f'initialization completed, now running permanent loop')
