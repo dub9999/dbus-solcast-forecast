@@ -30,7 +30,7 @@ __all__ = ['NAME', 'VERSION']
 
 FOLDER = os.path.dirname(os.path.abspath(__file__))
 DEF_PATH = "/run/media/sda1"
-LOGFILE = '/projects.log'
+LOGFILE = '/solcastforecast.log'
 
 UPDATE_INTERVAL = 250
 
