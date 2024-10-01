@@ -47,31 +47,36 @@ class EnergyCalculator(object):
                         'service' : 'com.victronenergy.battery.socketcan_can0', 
                         'path' : '/History/DischargedEnergy', 
                         'value' : None, 
-                        'gap' : 0
+                        'gap' : 0,
+                        'unit' : 'kWh'
                         },
         'retained' : {
                         'service' : 'com.victronenergy.battery.socketcan_can0', 
                         'path' : '/History/ChargedEnergy', 
                         'value' : None, 
-                        'gap' : 0
+                        'gap' : 0,
+                        'unit' : 'kWh'
                         },
         'imported' : {
                         'service' : 'com.victronenergy.grid.se_203', 
                         'path' : '/Ac/Energy/Forward', 
                         'value' : None, 
-                        'gap' : 0
+                        'gap' : 0,
+                        'unit' : 'kWh'
                         },
         'exported' : {
                         'service' : 'com.victronenergy.grid.se_203', 
                         'path' : '/Ac/Energy/Reverse', 
                         'value' : None, 
-                        'gap' : 0
+                        'gap' : 0,
+                        'unit' : 'kWh'
                         },
         'produced' : {
                         'service' : 'com.victronenergy.pvinverter.se_101', 
                         'path' : '/Ac/Energy/Forward', 
                         'value' : None, 
-                        'gap' : 0
+                        'gap' : 0,
+                        'unit' : 'kWh'
                         },
         }
         self.dbus_new_values={}
@@ -132,7 +137,14 @@ class SolcastForecast(object):
         #initialize forecast variable
         self.dbus_service_mains={
             'total_prod' : {'path' : '/TotalProduced', 'value' : 0},
-            'total_cons' : {'path' : '/TotalConsumed', 'value' : 0},
+            'total_p_10' : {'path' : '/TotalProduced10', 'value' : 0},
+            'total_p_90' : {'path' : '/TotalProduced90', 'value' : 0},
+            'total_rele' : {'path' : '/TotalConsumed', 'value' : 0},
+            'total_reta' : {'path' : '/TotalReleased', 'value' : 0},
+            'total_cons' : {'path' : '/TotalRetained', 'value' : 0},
+            'bat_socmin' : {'path' : '/SocMin', 'value' : 0},
+            'bat_socmax' : {'path' : '/SocMax', 'value' : 0},
+            'iteration' : {'path' : '/Iteration', 'value' : 0},
             'timestamp' : {'path' : '/Timestamp', 'value' : datetime.now().strftime("%Y-%m-%d %H:%M:00")}
             }
         self.dbus_service_lists={
@@ -228,7 +240,8 @@ class SolcastForecast(object):
             with open(filename, mode="r", encoding="utf-8") as file:
                 self.prod = json.load(file)
             #check if forecast is younger than 3 hours
-            td = datetime.utcnow() - datetime.strptime(self.prod['forecasts'][0]["period_end"], "%Y-%m-%dT%H:%M:%S.0000000Z")
+            td = datetime.utcnow() + timedelta(minutes=30) - datetime.strptime(
+                self.prod['forecasts'][0]["period_end"], "%Y-%m-%dT%H:%M:%S.0000000Z")
             if td.days==0 and td.seconds<=10800:
                  return True
             else:
@@ -245,13 +258,16 @@ class SolcastForecast(object):
     #to retrieve the production forecast from the solcast url
     def __curl_prod__(self):
         log.debug('Calling Solcast API url')
-        self.prod=json.load(os.popen("curl -s "+self.url))
-        if "forecasts" in self.prod:
-            return True
-        elif "response_status" in self.prod and "error_code" in self.prod["response_status"]:
-            log.error(f'error received from Solcast API: {self.prod["response_status"]["error_code"]}')
-        else:
-            log.error('unidentified error when contacting Solcast API')
+        try:
+            self.prod=json.load(os.popen("curl -s "+self.url))
+            if "forecasts" in self.prod:
+                return True
+            elif "response_status" in self.prod and "error_code" in self.prod["response_status"]:
+                log.error(f'error received from Solcast API: {self.prod["response_status"]["error_code"]}')
+            else:
+                log.error('unidentified error when contacting Solcast API')
+        except:
+            log.error('non interpretable answer received from Solcast API')
         return False
 
     #to validate value change on the dbus service
@@ -327,9 +343,6 @@ class SolcastForecast(object):
         out_top=2000                        #absolute max for out_max
         sp_min=0                            #lower cap of the interval for the regression
         sp_max=out_top                      #upper cap of the interval for the regression
-        soc_max=0                           #max forecasted battery soc
-        soc_min=100                         #min forecasted battery soc
-        self.out_max = (sp_min+sp_max)/2    #calculated max power output
         total_produced=0
         total_consumed=0
         #start the loops trying to find the optimal power output 
@@ -341,14 +354,20 @@ class SolcastForecast(object):
         #stop after 10 iterations in any case
         for iteration in range(10):
             #reset variables and lists
+            self.out_max=(sp_max+sp_min)/2
             total_produced=0
+            total_produced10=0
+            total_produced90=0
             total_consumed=0
+            total_released=0
+            total_retained=0
+            soc_max=0
+            soc_min=100
             ts=datetime.now()
             index = int((ts - datetime(ts.year, ts.month, ts.day, 0, 0, 0)).seconds/1800)+1
             #loop all the records of the solar production forecast (96 x 30 minutes periods)
             for item in self.prod['forecasts']:
-                #we are only interested in the forecast for the next 24 hours
-                #we stop after 48 records in any case
+                #we are only interested in the calculation for today and tomorrow
                 if index>95:
                     break
                 #adjust period_end value to local time
@@ -430,21 +449,26 @@ class SolcastForecast(object):
                 #update the total_cons and total_prod (in kWh)
                 #produced and consumed are calculated back into kWh so /100 and /2
                 total_produced+=self.values['produced'][index]/100/2
+                total_produced10+=item['pv_estimate10']/2
+                total_produced90+=item['pv_estimate90']/2
                 total_consumed+=self.values['consumed'][index]/100/2
+                total_released+=self.values['released'][index]/100/2
+                total_retained+=self.values['retained'][index]/100/2
                 #
                 index += 1
 
-            #update regression interval and continue loop if soc is going below lower limit
-            #or not recharging battery to the expected level
-            if (soc_min < self.dbus_import_params['soc_min']['value']+5) or (soc_max < 85):
+            #update regression interval and continue loop 
+            #if soc is going below lower limitor not recharging battery to the expected level,
+            # reduce out_max
+            if (total_retained/52 < total_released/48) or (soc_min < (self.dbus_import_params['soc_min']['value']+5)):
                 run_loop=1
                 sp_max=self.out_max
-                self.out_max=(self.out_max+sp_min)/2
-            #update regression interval and continue loop if soc is going above upper limit
+            #if soc is going above upper limit
+            # increase out_max
             elif soc_max > 95:
                 run_loop=1
                 sp_min=self.out_max
-                self.out_max=(sp_max+self.out_max)/2
+            #otherwise stop iterating
             else:
                 break
         #round the value
@@ -458,7 +482,14 @@ class SolcastForecast(object):
         #publish calculated values on dbus
         self.dbus_service['/Timestamp']=datetime.now().strftime('%Y-%m-%d %H:%M:00')
         self.dbus_service['/TotalProduced']=round(total_produced,3)
+        self.dbus_service['/TotalProduced10']=round(total_produced10,3)
+        self.dbus_service['/TotalProduced90']=round(total_produced90,3)
         self.dbus_service['/TotalConsumed']=round(total_consumed,3)
+        self.dbus_service['/TotalReleased']=round(total_released,3)
+        self.dbus_service['/TotalRetained']=round(total_retained,3)
+        self.dbus_service['/SocMin']=soc_min
+        self.dbus_service['/SocMax']=soc_max
+        self.dbus_service['/Iteration']=iteration
         for name, item in self.dbus_service_lists.items():
             self.dbus_service[f'{item["path"]}/0']=json.dumps(self.values[name][:48])
             self.dbus_service[f'{item["path"]}/1']=json.dumps(self.values[name][48:])
@@ -517,7 +548,7 @@ class SolcastForecast(object):
         #we use self.solcast_forecast_available
         # to calculate a new forecast as soon as a new hour starts after init
         try:
-            #everyd day reset the values
+            #every day reset the values
             if datetime.now().hour == 0 and not self.values_reset:
                 self.values_reset = True
                 for name, item in self.values.items():
@@ -525,21 +556,21 @@ class SolcastForecast(object):
             #reset
             if (datetime.now().hour != 0) and self.values_reset:
                 self.values_reset = False
-            #every 3 hours
+            #every 3 hours download the forecast
             if ((not(datetime.now().hour % 3) 
                 or (not datetime.now().minute % 30 and not self.solcast_forecast_available))
                 and not self.solcast_forecast_called):
                 #curl solcast api
+                self.solcast_forecast_called = True
                 if self.__curl_prod__():
                     self.solcast_forecast_available = True
                     self.__save_prod__()
                     log.debug('production_forecast saved to file')
-                self.solcast_forecast_called = True
             #reset
             if datetime.now().hour % 3 and self.solcast_forecast_called:
                 self.solcast_forecast_called = False
 
-            #every 30 mn period
+            #every 30 mn period update values, save consumption and calculate the forecast
             if not(datetime.now().minute % 30):
                 #calculate the consumption of the last 30 mn
                 #skip the first period end after init 
